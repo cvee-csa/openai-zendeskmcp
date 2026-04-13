@@ -5,6 +5,7 @@ A Zendesk-focused Model Context Protocol (MCP) server for helpdesk environments,
 ## What It Can Do
 
 - Read tickets, comments, and audits
+- Read users, groups, ticket fields, views, and ticket metrics
 - Search tickets with common helpdesk filters
 - Create tickets
 - Update tickets
@@ -79,7 +80,11 @@ Queue and ticket tools:
 - `get_ticket`
 - `get_ticket_comments`
 - `get_ticket_audits`
+- `get_ticket_metrics`
 - `summarize_ticket_history`
+- `list_ticket_fields`
+- `list_views`
+- `get_view_tickets`
 
 Write tools:
 
@@ -92,8 +97,10 @@ Write tools:
 
 People and org tools:
 
+- `get_user`
 - `find_user`
 - `find_org`
+- `list_groups`
 
 KB and workflow tools:
 

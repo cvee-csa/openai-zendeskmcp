@@ -22,6 +22,10 @@ if not SUBDOMAIN:
 else:
     BASE_URL = f"https://{SUBDOMAIN}.zendesk.com/api/v2"
 
+VALID_STATUSES = {"new", "open", "pending", "hold", "solved", "closed"}
+VALID_PRIORITIES = {"low", "normal", "high", "urgent"}
+VALID_TICKET_TYPES = {"problem", "incident", "question", "task"}
+
 
 class TicketSummary(BaseModel):
     id: int
@@ -132,6 +136,56 @@ class OrganizationSearchResponse(BaseModel):
     query: Optional[str] = None
 
 
+class UserDetailResponse(BaseModel):
+    id: int
+    name: Optional[str] = None
+    email: Optional[str] = None
+    organization_id: Optional[int] = None
+    role: Optional[str] = None
+    suspended: Optional[bool] = None
+    details: Optional[str] = None
+    notes: Optional[str] = None
+    time_zone: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class GroupSummary(BaseModel):
+    id: int
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_default: Optional[bool] = None
+    deleted: Optional[bool] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class GroupListResponse(BaseModel):
+    groups: List[GroupSummary]
+    count: int
+
+
+class TicketFieldOption(BaseModel):
+    name: Optional[str] = None
+    value: Optional[str] = None
+
+
+class TicketFieldSummary(BaseModel):
+    id: int
+    title: Optional[str] = None
+    type: Optional[str] = None
+    description: Optional[str] = None
+    required: Optional[bool] = None
+    active: Optional[bool] = None
+    visible_in_portal: Optional[bool] = None
+    custom_field_options: List[TicketFieldOption] = Field(default_factory=list)
+
+
+class TicketFieldListResponse(BaseModel):
+    ticket_fields: List[TicketFieldSummary]
+    count: int
+
+
 class ArticleSummary(BaseModel):
     id: int
     title: Optional[str] = None
@@ -171,6 +225,89 @@ class EscalationRiskResponse(BaseModel):
     signals: List[str] = Field(default_factory=list)
 
 
+class ViewSummary(BaseModel):
+    id: int
+    title: Optional[str] = None
+    description: Optional[str] = None
+    position: Optional[int] = None
+    active: Optional[bool] = None
+    execution: Optional[Dict[str, Any]] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class ViewListResponse(BaseModel):
+    views: List[ViewSummary]
+    count: int
+
+
+class TicketMetricsResponse(BaseModel):
+    ticket_id: int
+    reply_time_in_minutes: Optional[Dict[str, Any]] = None
+    full_resolution_time_in_minutes: Optional[Dict[str, Any]] = None
+    agent_wait_time_in_minutes: Optional[Dict[str, Any]] = None
+    requester_wait_time_in_minutes: Optional[Dict[str, Any]] = None
+    on_hold_time_in_minutes: Optional[Dict[str, Any]] = None
+    group_stations: Optional[int] = None
+    assignee_stations: Optional[int] = None
+    reopens: Optional[int] = None
+    replies: Optional[int] = None
+    assignee_updated_at: Optional[str] = None
+    requester_updated_at: Optional[str] = None
+    status_updated_at: Optional[str] = None
+    initially_assigned_at: Optional[str] = None
+    assigned_at: Optional[str] = None
+    solved_at: Optional[str] = None
+    latest_comment_added_at: Optional[str] = None
+
+
+def _clean_text(value: str, *, field_name: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} must not be empty.")
+    return cleaned
+
+
+def _validate_choice(
+    value: Optional[str],
+    *,
+    field_name: str,
+    allowed: set[str],
+) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = _clean_text(value, field_name=field_name).lower()
+    if normalized not in allowed:
+        allowed_values = ", ".join(sorted(allowed))
+        raise ValueError(f"{field_name} must be one of: {allowed_values}.")
+    return normalized
+
+
+def _normalize_tags(tags: Optional[List[str]]) -> Optional[List[str]]:
+    if tags is None:
+        return None
+    normalized = [_clean_text(tag, field_name="tag") for tag in tags]
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("tags must not contain duplicates.")
+    return normalized
+
+
+def _extract_error_message(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        description = payload.get("description")
+        details = payload.get("details")
+        parts = [str(part) for part in (error, description, details) if part]
+        if parts:
+            return " - ".join(parts)
+    return response.text.strip() or "Zendesk returned an error without a response body."
+
+
 def _require_config() -> None:
     missing = []
     if not SUBDOMAIN:
@@ -196,16 +333,27 @@ def _zd_request(
 ) -> Dict[str, Any]:
     _require_config()
     url = f"{BASE_URL}{path}"
-    response = requests.request(
-        method,
-        url,
-        params=params,
-        json=json,
-        auth=_auth(),
-        timeout=TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.request(
+            method,
+            url,
+            params=params,
+            json=json,
+            auth=_auth(),
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else "unknown"
+        message = _extract_error_message(exc.response) if exc.response is not None else str(exc)
+        raise RuntimeError(f"Zendesk API request failed ({status_code}): {message}") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Zendesk API request failed: {exc}") from exc
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError("Zendesk returned a non-JSON response.") from exc
 
 
 def _ticket_summary(ticket: Dict[str, Any]) -> TicketSummary:
@@ -266,6 +414,75 @@ def _article_summary(article: Dict[str, Any]) -> ArticleSummary:
         category_id=article.get("category_id"),
         locale=article.get("locale"),
         label_names=article.get("label_names") or [],
+    )
+
+
+def _user_summary(user: Dict[str, Any]) -> UserSummary:
+    return UserSummary(
+        id=user["id"],
+        name=user.get("name"),
+        email=user.get("email"),
+        organization_id=user.get("organization_id"),
+        role=user.get("role"),
+        suspended=user.get("suspended"),
+    )
+
+
+def _user_detail(user: Dict[str, Any]) -> UserDetailResponse:
+    return UserDetailResponse(
+        id=user["id"],
+        name=user.get("name"),
+        email=user.get("email"),
+        organization_id=user.get("organization_id"),
+        role=user.get("role"),
+        suspended=user.get("suspended"),
+        details=user.get("details"),
+        notes=user.get("notes"),
+        time_zone=user.get("time_zone"),
+        created_at=user.get("created_at"),
+        updated_at=user.get("updated_at"),
+    )
+
+
+def _group_summary(group: Dict[str, Any]) -> GroupSummary:
+    return GroupSummary(
+        id=group["id"],
+        name=group.get("name"),
+        description=group.get("description"),
+        is_default=group.get("is_default"),
+        deleted=group.get("deleted"),
+        created_at=group.get("created_at"),
+        updated_at=group.get("updated_at"),
+    )
+
+
+def _ticket_field_summary(ticket_field: Dict[str, Any]) -> TicketFieldSummary:
+    options = [
+        TicketFieldOption(name=option.get("name"), value=option.get("value"))
+        for option in ticket_field.get("custom_field_options", [])
+    ]
+    return TicketFieldSummary(
+        id=ticket_field["id"],
+        title=ticket_field.get("title"),
+        type=ticket_field.get("type"),
+        description=ticket_field.get("description"),
+        required=ticket_field.get("required"),
+        active=ticket_field.get("active"),
+        visible_in_portal=ticket_field.get("visible_in_portal"),
+        custom_field_options=options,
+    )
+
+
+def _view_summary(view: Dict[str, Any]) -> ViewSummary:
+    return ViewSummary(
+        id=view["id"],
+        title=view.get("title"),
+        description=view.get("description"),
+        position=view.get("position"),
+        active=view.get("active"),
+        execution=view.get("execution"),
+        created_at=view.get("created_at"),
+        updated_at=view.get("updated_at"),
     )
 
 
@@ -438,6 +655,7 @@ def summarize_ticket_history(ticket_id: int) -> Dict[str, Any]:
 @mcp.tool()
 def add_internal_note(ticket_id: int, note: str) -> Dict[str, Any]:
     """Add a private internal note to a ticket."""
+    note = _clean_text(note, field_name="note")
     _zd_request(
         "PUT",
         f"/tickets/{ticket_id}.json",
@@ -470,6 +688,7 @@ def draft_public_reply(ticket_id: int) -> Dict[str, Any]:
 @mcp.tool()
 def send_public_reply(ticket_id: int, reply: str) -> Dict[str, Any]:
     """Send a public reply to a ticket."""
+    reply = _clean_text(reply, field_name="reply")
     _zd_request(
         "PUT",
         f"/tickets/{ticket_id}.json",
@@ -490,6 +709,12 @@ def create_ticket(
     custom_fields: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Create a Zendesk ticket."""
+    subject = _clean_text(subject, field_name="subject")
+    description = _clean_text(description, field_name="description")
+    priority = _validate_choice(priority, field_name="priority", allowed=VALID_PRIORITIES)
+    ticket_type = _validate_choice(ticket_type, field_name="ticket_type", allowed=VALID_TICKET_TYPES)
+    tags = _normalize_tags(tags)
+
     ticket: Dict[str, Any] = {
         "subject": subject,
         "comment": {"body": description},
@@ -531,23 +756,26 @@ def update_ticket(
     """Update writable ticket fields."""
     ticket: Dict[str, Any] = {}
     if subject is not None:
-        ticket["subject"] = subject
+        ticket["subject"] = _clean_text(subject, field_name="subject")
     if status is not None:
-        ticket["status"] = status
+        ticket["status"] = _validate_choice(status, field_name="status", allowed=VALID_STATUSES)
     if priority is not None:
-        ticket["priority"] = priority
+        ticket["priority"] = _validate_choice(priority, field_name="priority", allowed=VALID_PRIORITIES)
     if ticket_type is not None:
-        ticket["type"] = ticket_type
+        ticket["type"] = _validate_choice(ticket_type, field_name="ticket_type", allowed=VALID_TICKET_TYPES)
     if assignee_id is not None:
         ticket["assignee_id"] = assignee_id
     if requester_id is not None:
         ticket["requester_id"] = requester_id
     if tags is not None:
-        ticket["tags"] = tags
+        ticket["tags"] = _normalize_tags(tags)
     if custom_fields is not None:
         ticket["custom_fields"] = custom_fields
     if due_at is not None:
-        ticket["due_at"] = due_at
+        ticket["due_at"] = _clean_text(due_at, field_name="due_at")
+
+    if not ticket:
+        raise ValueError("update_ticket requires at least one field to update.")
 
     _zd_request("PUT", f"/tickets/{ticket_id}.json", json={"ticket": ticket})
     return MutationResponse(success=True, ticket_id=ticket_id, message="Ticket updated.").model_dump()
@@ -565,18 +793,18 @@ def reassign_ticket(ticket_id: int, assignee_id: int) -> Dict[str, Any]:
 
 
 @mcp.tool()
+def get_user(user_id: int) -> Dict[str, Any]:
+    """Fetch a single Zendesk user by ID."""
+    data = _zd_request("GET", f"/users/{user_id}.json")
+    return _user_detail(data["user"]).model_dump()
+
+
+@mcp.tool()
 def find_user(query: str) -> Dict[str, Any]:
     """Find Zendesk users via search."""
     data = _zd_request("GET", "/search.json", params={"query": f"type:user {query}"})
     users = [
-        UserSummary(
-            id=u["id"],
-            name=u.get("name"),
-            email=u.get("email"),
-            organization_id=u.get("organization_id"),
-            role=u.get("role"),
-            suspended=u.get("suspended"),
-        )
+        _user_summary(u)
         for u in data.get("results", [])
         if u.get("result_type") == "user"
     ]
@@ -600,6 +828,69 @@ def find_org(query: str) -> Dict[str, Any]:
         if o.get("result_type") == "organization"
     ]
     return OrganizationSearchResponse(organizations=orgs, count=len(orgs), query=query).model_dump()
+
+
+@mcp.tool()
+def list_groups() -> Dict[str, Any]:
+    """List Zendesk groups."""
+    data = _zd_request("GET", "/groups.json")
+    groups = [_group_summary(group) for group in data.get("groups", [])]
+    return GroupListResponse(groups=groups, count=len(groups)).model_dump()
+
+
+@mcp.tool()
+def list_ticket_fields() -> Dict[str, Any]:
+    """List Zendesk ticket fields and custom field metadata."""
+    data = _zd_request("GET", "/ticket_fields.json")
+    ticket_fields = [_ticket_field_summary(ticket_field) for ticket_field in data.get("ticket_fields", [])]
+    return TicketFieldListResponse(ticket_fields=ticket_fields, count=len(ticket_fields)).model_dump()
+
+
+@mcp.tool()
+def list_views() -> Dict[str, Any]:
+    """List Zendesk ticket views."""
+    data = _zd_request("GET", "/views.json")
+    views = [_view_summary(view) for view in data.get("views", [])]
+    return ViewListResponse(views=views, count=len(views)).model_dump()
+
+
+@mcp.tool()
+def get_view_tickets(view_id: int, page: int = 1, per_page: int = 25) -> Dict[str, Any]:
+    """List tickets returned by a Zendesk view."""
+    per_page = max(1, min(per_page, 100))
+    data = _zd_request(
+        "GET",
+        f"/views/{view_id}/tickets.json",
+        params={"page": page, "per_page": per_page},
+    )
+    tickets = [_ticket_summary(ticket) for ticket in data.get("tickets", [])]
+    return TicketListResponse(tickets=tickets, count=len(tickets), query=f"view:{view_id}").model_dump()
+
+
+@mcp.tool()
+def get_ticket_metrics(ticket_id: int) -> Dict[str, Any]:
+    """Fetch Zendesk ticket metrics for SLA and handling analysis."""
+    data = _zd_request("GET", f"/tickets/{ticket_id}/metrics.json")
+    metrics = data["ticket_metric"]
+    return TicketMetricsResponse(
+        ticket_id=ticket_id,
+        reply_time_in_minutes=metrics.get("reply_time_in_minutes"),
+        full_resolution_time_in_minutes=metrics.get("full_resolution_time_in_minutes"),
+        agent_wait_time_in_minutes=metrics.get("agent_wait_time_in_minutes"),
+        requester_wait_time_in_minutes=metrics.get("requester_wait_time_in_minutes"),
+        on_hold_time_in_minutes=metrics.get("on_hold_time_in_minutes"),
+        group_stations=metrics.get("group_stations"),
+        assignee_stations=metrics.get("assignee_stations"),
+        reopens=metrics.get("reopens"),
+        replies=metrics.get("replies"),
+        assignee_updated_at=metrics.get("assignee_updated_at"),
+        requester_updated_at=metrics.get("requester_updated_at"),
+        status_updated_at=metrics.get("status_updated_at"),
+        initially_assigned_at=metrics.get("initially_assigned_at"),
+        assigned_at=metrics.get("assigned_at"),
+        solved_at=metrics.get("solved_at"),
+        latest_comment_added_at=metrics.get("latest_comment_added_at"),
+    ).model_dump()
 
 
 @mcp.tool()
