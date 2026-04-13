@@ -1,0 +1,22 @@
+
+`pyproject.toml`
+```toml
+[project]
+name = "openai-zendeskmcp"
+version = "0.2.0"
+description = "Zendesk MCP server for helpdesk workflows"
+requires-python = ">=3.12"
+
+dependencies = [
+    "mcp[cli]>=1.1.2",
+    "python-dotenv>=1.0.1",
+    "requests>=2.32.0",
+    "pydantic>=2.7.0"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+zendesk = "zendesk_mcp_server:main"
