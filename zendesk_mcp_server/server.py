@@ -1,6 +1,10 @@
+import json
 import os
+import secrets
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
@@ -13,7 +17,17 @@ mcp = FastMCP("Zendesk MCP Server", json_response=True)
 
 SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "").strip()
 EMAIL = os.getenv("ZENDESK_EMAIL", "").strip()
-TOKEN = os.getenv("ZENDESK_API_TOKEN", "").strip()
+API_TOKEN = os.getenv("ZENDESK_API_TOKEN", "").strip()
+CLIENT_ID = os.getenv("ZENDESK_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("ZENDESK_CLIENT_SECRET", "").strip()
+REDIRECT_URI = os.getenv("ZENDESK_REDIRECT_URI", "https://localhost/callback").strip()
+OAUTH_SCOPES = os.getenv("ZENDESK_OAUTH_SCOPES", "read write").strip()
+TOKEN_PATH = Path(
+    os.getenv(
+        "ZENDESK_OAUTH_TOKEN_PATH",
+        Path(__file__).resolve().parents[1] / ".zendesk_oauth_tokens.json",
+    )
+)
 TIMEOUT = int(os.getenv("ZENDESK_TIMEOUT_SECONDS", "30"))
 HELP_CENTER_PAGE_SIZE = int(os.getenv("ZENDESK_HELP_CENTER_PAGE_SIZE", "25"))
 
@@ -25,6 +39,22 @@ else:
 VALID_STATUSES = {"new", "open", "pending", "hold", "solved", "closed"}
 VALID_PRIORITIES = {"low", "normal", "high", "urgent"}
 VALID_TICKET_TYPES = {"problem", "incident", "question", "task"}
+TOKEN_REFRESH_BUFFER_SECONDS = 60
+_pending_oauth_state: Optional[str] = None
+
+
+class OAuthStartResponse(BaseModel):
+    authorization_url: str
+    state: str
+    redirect_uri: str
+    scope: str
+
+
+class OAuthCompleteResponse(BaseModel):
+    success: bool
+    message: str
+    expires_in: int
+    scope: Optional[str] = None
 
 
 class TicketSummary(BaseModel):
@@ -312,16 +342,172 @@ def _require_config() -> None:
     missing = []
     if not SUBDOMAIN:
         missing.append("ZENDESK_SUBDOMAIN")
-    if not EMAIL:
-        missing.append("ZENDESK_EMAIL")
-    if not TOKEN:
-        missing.append("ZENDESK_API_TOKEN")
+    if not _has_oauth_config() and not _has_api_token_config():
+        missing.append("either ZENDESK_CLIENT_ID/ZENDESK_CLIENT_SECRET or ZENDESK_EMAIL/ZENDESK_API_TOKEN")
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 
-def _auth() -> tuple[str, str]:
-    return (f"{EMAIL}/token", TOKEN)
+def _has_oauth_config() -> bool:
+    return bool(CLIENT_ID and CLIENT_SECRET)
+
+
+def _has_api_token_config() -> bool:
+    return bool(EMAIL and API_TOKEN)
+
+
+def _auth_mode() -> Literal["oauth", "api_token"]:
+    if _has_oauth_config():
+        return "oauth"
+    if _has_api_token_config():
+        return "api_token"
+    raise RuntimeError(
+        "Missing Zendesk auth configuration. Set either ZENDESK_CLIENT_ID/ZENDESK_CLIENT_SECRET or ZENDESK_EMAIL/ZENDESK_API_TOKEN."
+    )
+
+
+def _legacy_auth() -> tuple[str, str]:
+    return (f"{EMAIL}/token", API_TOKEN)
+
+
+def _load_token_data() -> Optional[Dict[str, Any]]:
+    if not TOKEN_PATH.exists():
+        return None
+    try:
+        return json.loads(TOKEN_PATH.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"OAuth token file is invalid JSON: {TOKEN_PATH}") from exc
+
+
+def _save_token_data(token_data: Dict[str, Any]) -> None:
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_PATH.write_text(json.dumps(token_data, indent=2))
+
+
+def _oauth_token_url() -> str:
+    if not SUBDOMAIN:
+        raise RuntimeError("Missing required environment variable: ZENDESK_SUBDOMAIN")
+    return f"https://{SUBDOMAIN}.zendesk.com/oauth/tokens"
+
+
+def _oauth_authorization_url(*, state: str, scope: Optional[str] = None) -> str:
+    if not SUBDOMAIN:
+        raise RuntimeError("Missing required environment variable: ZENDESK_SUBDOMAIN")
+    if not _has_oauth_config():
+        raise RuntimeError("OAuth authorization requires ZENDESK_CLIENT_ID and ZENDESK_CLIENT_SECRET.")
+    query = urlencode(
+        {
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "scope": (scope or OAUTH_SCOPES).strip(),
+            "state": state,
+        }
+    )
+    return f"https://{SUBDOMAIN}.zendesk.com/oauth/authorizations/new?{query}"
+
+
+def _token_expired(token_data: Dict[str, Any]) -> bool:
+    expires_at = int(token_data.get("expires_at", 0))
+    return expires_at <= int(time.time())
+
+
+def _build_stored_token_data(token_response: Dict[str, Any], *, preserve_refresh_token: Optional[str] = None) -> Dict[str, Any]:
+    refresh_token = token_response.get("refresh_token") or preserve_refresh_token
+    if not refresh_token:
+        raise RuntimeError("Zendesk OAuth response did not include a refresh token.")
+    expires_in = int(token_response["expires_in"])
+    stored = {
+        "access_token": token_response["access_token"],
+        "refresh_token": refresh_token,
+        "token_type": token_response.get("token_type", "bearer"),
+        "scope": token_response.get("scope", OAUTH_SCOPES),
+        "expires_in": expires_in,
+        "expires_at": int(time.time()) + expires_in - TOKEN_REFRESH_BUFFER_SECONDS,
+    }
+    if "refresh_token_expires_in" in token_response:
+        stored["refresh_token_expires_in"] = token_response["refresh_token_expires_in"]
+    return stored
+
+
+def _exchange_authorization_code(code: str) -> Dict[str, Any]:
+    _require_config()
+    if not _has_oauth_config():
+        raise RuntimeError("OAuth authorization requires ZENDESK_CLIENT_ID and ZENDESK_CLIENT_SECRET.")
+    try:
+        response = requests.post(
+            _oauth_token_url(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "redirect_uri": REDIRECT_URI,
+                "scope": OAUTH_SCOPES,
+            },
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else "unknown"
+        message = _extract_error_message(exc.response) if exc.response is not None else str(exc)
+        raise RuntimeError(f"Zendesk OAuth token exchange failed ({status_code}): {message}") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Zendesk OAuth token exchange failed: {exc}") from exc
+
+    return _build_stored_token_data(response.json())
+
+
+def _refresh_access_token() -> Dict[str, Any]:
+    _require_config()
+    if not _has_oauth_config():
+        raise RuntimeError("OAuth token refresh requires ZENDESK_CLIENT_ID and ZENDESK_CLIENT_SECRET.")
+    token_data = _load_token_data()
+    if not token_data or "refresh_token" not in token_data:
+        raise RuntimeError(
+            "No Zendesk OAuth refresh token is stored. Run begin_oauth_authorization and complete_oauth_authorization first."
+        )
+
+    try:
+        response = requests.post(
+            _oauth_token_url(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": token_data["refresh_token"],
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            },
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else "unknown"
+        message = _extract_error_message(exc.response) if exc.response is not None else str(exc)
+        raise RuntimeError(f"Zendesk OAuth refresh failed ({status_code}): {message}") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Zendesk OAuth refresh failed: {exc}") from exc
+
+    refreshed = _build_stored_token_data(
+        response.json(),
+        preserve_refresh_token=token_data["refresh_token"],
+    )
+    _save_token_data(refreshed)
+    return refreshed
+
+
+def _get_access_token(*, force_refresh: bool = False) -> str:
+    if not _has_oauth_config():
+        raise RuntimeError("OAuth access tokens require ZENDESK_CLIENT_ID and ZENDESK_CLIENT_SECRET.")
+    token_data = _load_token_data()
+    if not token_data:
+        raise RuntimeError(
+            f"No Zendesk OAuth token file found at {TOKEN_PATH}. Run begin_oauth_authorization and complete_oauth_authorization first."
+        )
+    if force_refresh or _token_expired(token_data):
+        token_data = _refresh_access_token()
+    return str(token_data["access_token"])
 
 
 def _zd_request(
@@ -333,15 +519,33 @@ def _zd_request(
 ) -> Dict[str, Any]:
     _require_config()
     url = f"{BASE_URL}{path}"
+    auth_mode = _auth_mode()
     try:
-        response = requests.request(
-            method,
-            url,
-            params=params,
-            json=json,
-            auth=_auth(),
-            timeout=TIMEOUT,
-        )
+        if auth_mode == "oauth":
+            access_token = _get_access_token()
+
+            def do_request(token: str) -> requests.Response:
+                return requests.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=TIMEOUT,
+                )
+
+            response = do_request(access_token)
+            if response.status_code == 401:
+                response = do_request(_get_access_token(force_refresh=True))
+        else:
+            response = requests.request(
+                method,
+                url,
+                params=params,
+                json=json,
+                auth=_legacy_auth(),
+                timeout=TIMEOUT,
+            )
         response.raise_for_status()
     except requests.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else "unknown"
@@ -354,6 +558,45 @@ def _zd_request(
         return response.json()
     except ValueError as exc:
         raise RuntimeError("Zendesk returned a non-JSON response.") from exc
+
+
+@mcp.tool()
+def begin_oauth_authorization(scope: Optional[str] = None) -> Dict[str, Any]:
+    """Start the one-time Zendesk OAuth authorization-code flow."""
+    _require_config()
+    if not _has_oauth_config():
+        raise RuntimeError("begin_oauth_authorization requires ZENDESK_CLIENT_ID and ZENDESK_CLIENT_SECRET.")
+    global _pending_oauth_state
+    _pending_oauth_state = secrets.token_urlsafe(24)
+    selected_scope = _clean_text(scope, field_name="scope") if scope is not None else OAUTH_SCOPES
+    return OAuthStartResponse(
+        authorization_url=_oauth_authorization_url(state=_pending_oauth_state, scope=selected_scope),
+        state=_pending_oauth_state,
+        redirect_uri=REDIRECT_URI,
+        scope=selected_scope,
+    ).model_dump()
+
+
+@mcp.tool()
+def complete_oauth_authorization(code: str, state: str) -> Dict[str, Any]:
+    """Finish Zendesk OAuth authorization after approving access in the browser."""
+    global _pending_oauth_state
+    auth_code = _clean_text(code, field_name="code")
+    returned_state = _clean_text(state, field_name="state")
+    if not _pending_oauth_state:
+        raise RuntimeError("No pending OAuth authorization exists. Run begin_oauth_authorization first.")
+    if returned_state != _pending_oauth_state:
+        raise RuntimeError("OAuth state mismatch. Start the authorization flow again.")
+
+    token_data = _exchange_authorization_code(auth_code)
+    _save_token_data(token_data)
+    _pending_oauth_state = None
+    return OAuthCompleteResponse(
+        success=True,
+        message=f"Zendesk OAuth tokens saved to {TOKEN_PATH}. Existing MCP tools will now use Bearer auth.",
+        expires_in=int(token_data["expires_in"]),
+        scope=token_data.get("scope"),
+    ).model_dump()
 
 
 def _ticket_summary(ticket: Dict[str, Any]) -> TicketSummary:

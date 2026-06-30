@@ -28,11 +28,16 @@ A Zendesk-focused Model Context Protocol (MCP) server for helpdesk environments,
 Required:
 
 - `ZENDESK_SUBDOMAIN`
-- `ZENDESK_EMAIL`
-- `ZENDESK_API_TOKEN`
 
 Optional:
 
+- `ZENDESK_EMAIL`
+- `ZENDESK_API_TOKEN`
+- `ZENDESK_CLIENT_ID`
+- `ZENDESK_CLIENT_SECRET`
+- `ZENDESK_REDIRECT_URI`
+- `ZENDESK_OAUTH_SCOPES`
+- `ZENDESK_OAUTH_TOKEN_PATH`
 - `ZENDESK_TIMEOUT_SECONDS`
 - `ZENDESK_HELP_CENTER_PAGE_SIZE`
 
@@ -51,6 +56,28 @@ python3 -m venv .venv
 ```
 
 The server loads `.env` from the repository root, so it can still find credentials when launched by an MCP client from outside this directory.
+
+Auth modes:
+
+- Preferred: OAuth with `ZENDESK_CLIENT_ID` and `ZENDESK_CLIENT_SECRET`
+- Legacy fallback: API token with `ZENDESK_EMAIL` and `ZENDESK_API_TOKEN`
+
+If both are configured, the server prefers OAuth.
+
+## One-Time OAuth Setup
+
+The MCP tool surface stays the same. If OAuth is configured, the server authenticates with Zendesk OAuth `authorization_code` tokens. If only legacy credentials are configured, it continues using API token auth until you migrate.
+
+1. Create a Zendesk OAuth client in Admin Center.
+2. Set the client kind to `Confidential`.
+3. Add a redirect URI such as `https://localhost/callback`.
+4. Fill in `.env` with your subdomain, client ID, client secret, and redirect URI.
+5. Start the MCP server and call `begin_oauth_authorization`.
+6. Open the returned `authorization_url` in a browser and approve access.
+7. After Zendesk redirects to your `redirect_uri`, copy the `code` and `state` query params from the address bar.
+8. Call `complete_oauth_authorization(code=..., state=...)`.
+
+By default, the server stores tokens in `.zendesk_oauth_tokens.json` and refreshes them automatically before expiry or after a `401` response.
 
 ## Add To Codex
 
@@ -114,3 +141,5 @@ KB and workflow tools:
 - `draft_public_reply` is intentionally read-only and does not write to Zendesk.
 - `send_public_reply` is separated from internal notes to reduce accidental public responses.
 - `search_tickets` supports queue-style filters such as status, priority, assignee, requester, group, tags, and date ranges.
+- OAuth setup tools are only needed when you want to use OAuth mode.
+- If the refresh token expires or is revoked, run the one-time OAuth setup again.
